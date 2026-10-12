@@ -5,9 +5,9 @@
   /* 系统字体打头：mac 上即 SF Pro / SF Mono，原生质感；不依赖任何 webfont，离线一致 */
   --font-ui: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", "Inter", sans-serif;
   --font-display: var(--font-ui);
-  --font-mono: ui-monospace, "SF Mono", Menlo, "JetBrains Mono", monospace;
+  --font-mono: ui-monospace, "SF Mono", Menlo, "Cascadia Mono", Consolas, "JetBrains Mono", monospace;
   /* 内嵌终端字体：优先用户装的 Nerd Font（starship/powerline 字形才不变 tofu），没装回退系统等宽 */
-  --font-term: "JetBrainsMono Nerd Font", "MesloLGS NF", "FiraCode Nerd Font", "Hack Nerd Font", "Symbols Nerd Font Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-term: "JetBrainsMono Nerd Font", "MesloLGS NF", "FiraCode Nerd Font", "Hack Nerd Font", "Symbols Nerd Font Mono", "Cascadia Mono", Consolas, ui-monospace, "SF Mono", Menlo, monospace;
   --font-fname: var(--font-ui);
 }
 
@@ -1225,6 +1225,9 @@ kbd {
 /* 预览全屏时顶栏被盖住，但它的 drag 区域是 OS 级遮罩、不认 z-index，会吞掉压在它上面的预览按钮的点击。
    全屏期间把顶栏/品牌区的拖拽关掉，让预览自己的按钮可点（全屏本就不需要拖这条顶栏）。 */
 .desktop.preview-maxed #topbar, .desktop.preview-maxed .brand { -webkit-app-region: no-drag; }
+/* Windows：右上角系统三键（titleBarOverlay）压在顶栏上，给它们留出空位 */
+.platform-win #topbar { padding-right: 150px; }
+.platform-win.preview-maxed #topbar { padding-right: 150px; }
 
 /* 终端头：文件跟随按钮 */
 .nav-buttons #btn-sidebar.on { color: var(--accent); border-color: var(--accent); }
@@ -1484,3 +1487,31 @@ body { transition: background-color 0.28s ease, color 0.28s ease; }
 .tr-say { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text-faint); }
 .tr-files { flex: none; color: var(--text-dim); }
 [data-theme="editorial"] .tr-row.active { border-left-width: 3px; }
+/* Agent 用量：实时速率条（近1分钟窗口 + 近10分钟柱状，借 DSH token-meter 的口径） */
+.usage-live { margin: 2px 0 10px; }
+.usage-live-head { font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.usage-live-head b { color: var(--text); font-weight: 700; }
+.live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); display: inline-block; flex: none; }
+.live-dot.on { background: var(--green); animation: livePulse 1.6s ease-in-out infinite; }
+@keyframes livePulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+.usage-bars { display: flex; align-items: flex-end; gap: 3px; height: 26px; margin: 7px 0 5px; }
+.usage-bars i { flex: 1; min-height: 2px; background: var(--accent-soft); border-radius: 2px 2px 0 0; transition: height .5s ease; }
+.usage-bars i.now { background: var(--accent); }
+/* 终端标签：关闭钮热区扩大 + 拥挤模式收窄 */
+.term-tab .tab-x { padding: 2px 4px; margin: 0 -2px 0 2px; border-radius: 4px; }
+.term-tabs.crowded { gap: 2px; }
+.term-tabs.crowded .term-tab { padding: 3px 6px; gap: 3px; font-size: 11.5px; }
+.term-tabs.crowded .term-tab .tab-x { padding: 3px 5px; margin: 0 -1px 0 2px; }
+/* ---------- 拖窗体验增强：chrome 区禁选字 + 扩大可拖区域 ---------- */
+/* 顶栏/品牌区/终端头/预览头都是「窗框」：想拖动时一按就选中文字太糟，全部禁选 */
+.desktop #topbar, .desktop .brand, .desktop .term-head, .desktop .preview-head { user-select: none; -webkit-user-select: none; }
+/* 终端头空白处可拖窗（终端常占半个屏，原来只有最顶上一条能拖）；标签/按钮保持可点 */
+.desktop .term-head { -webkit-app-region: drag; }
+.desktop .term-head .term-tabs, .desktop .term-head .term-actions, .desktop .term-head button, .desktop .term-head input { -webkit-app-region: no-drag; }
+/* 预览头空白处同理（预览全屏时它就是唯一的「标题栏」） */
+.desktop .preview-head { -webkit-app-region: drag; }
+.desktop .preview-head .preview-title, .desktop .preview-head .preview-actions, .desktop .preview-head button { -webkit-app-region: no-drag; }
+/* Windows:侧栏顶部 40px 是给 mac 红绿灯留的(Windows 三键在右上),收掉;
+   品牌行本身是拖拽区,上移后「名称及其上方」整块都能拖窗 */
+.platform-win #sidebar { padding-top: 0; }
+.platform-win .brand { padding: 16px 8px 16px; }

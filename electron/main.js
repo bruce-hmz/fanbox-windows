@@ -17,12 +17,14 @@ const fs = require('fs');
 process.env.FANBOX_NO_OPEN = '1';
 const PORT = Number(process.env.FANBOX_PORT) || 4567;
 
-// node-pty 是原生模块，需 electron-rebuild 编译过；未就绪时终端能力降级但 app 仍可用
+// node-pty 是原生模块；Windows 用 @lydell/node-pty（带 Electron 预编译产物，免 VS 构建链），
+// mac 沿用原版。未就绪时终端能力降级但 app 仍可用
 let pty = null;
-try { pty = require('node-pty'); }
-catch (e) { console.error('[fanbox] node-pty 未就绪（跑 npm run rebuild）：', e.message); }
+try { pty = require('@lydell/node-pty'); }
+catch (e1) { try { pty = require('node-pty'); } catch (e) { console.error('[fanbox] node-pty 未就绪（跑 npm run rebuild）：', e.message); } }
 
 const terminals = new Map();
+const pidCwd = new Map();     // pid -> 启动目录（Windows 无 lsof，termCwdByPid 的 win 分支用）
 const termTails = new Map(); // id -> 最近输出尾巴（去 ANSI），给微信 agent 感知别的终端在跑啥/卡哪
 let win = null;
 
@@ -45,18 +47,46 @@ const termFacts = new Map();
 // 所以文件内容对所有终端相同。--noproxy：用户开着系统代理时 curl 127.0.0.1 会被拦掉（实测）。
 const HOOKS_DIR = () => path.join(os.homedir(), '.fanbox', 'hooks');
 const HOOK_CURL = `curl -s --noproxy '*' -m 3 -X POST "$FANBOX_CTL/event" -H "x-fanbox-token: $FANBOX_CTL_TOKEN" -H "x-fanbox-term: $FANBOX_TERM_ID" -H 'content-type: application/json' --data-binary`;
+// 跨平台 hook 转发器：stdin/argv 里的事件 JSON POST 给本机服务。node 由 Claude Code 用户必有、
+// codex Windows 用户基本都有；不依赖 shell 语法（cmd/bash 通吃），中文/代理/重定向的坑一次绕开
+const HOOK_JS = `#!/usr/bin/env node
+// FanBox 启动时生成：agent hook 事件转发器（stdin JSON → POST $FANBOX_CTL/event）。零依赖，异常全静默。
+const http = require('http');
+let raw = '';
+try { raw = require('fs').readFileSync(0, 'utf8'); } catch { /* stdin 关了 */ }
+const ctl = process.env.FANBOX_CTL, token = process.env.FANBOX_CTL_TOKEN, term = process.env.FANBOX_TERM_ID || '';
+process.exitCode = 0;
+if (!ctl || !token) process.exit(0);
+const post = (body) => {
+  try {
+    const u = new URL(ctl + '/event');
+    const req = http.request({ hostname: u.hostname, port: u.port, path: u.pathname, method: 'POST',
+      headers: { 'x-fanbox-token': token, 'x-fanbox-term': term, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }, timeout: 3000 },
+      (res) => { res.resume(); res.on('end', () => process.exit(0)); });
+    req.on('error', () => process.exit(0));
+    req.on('timeout', () => { try { req.destroy(); } catch { /* */ } process.exit(0); });
+    req.end(body);
+  } catch { process.exit(0); }
+};
+post(Buffer.from(raw || '{}', 'utf8'));
+setTimeout(() => process.exit(0), 3500).unref();
+`;
 function writeHookFiles() {
   try {
     const dir = HOOKS_DIR();
     fs.mkdirSync(dir, { recursive: true });
+    const hookJs = path.join(dir, 'fanbox-hook.js');
+    fs.writeFileSync(hookJs, HOOK_JS);
+    try { fs.chmodSync(hookJs, 0o755); } catch { /* Windows 无所谓 */ }
+    const hookCmd = `node "${hookJs.replace(/\\/g, '/')}"`;
     // async：hook 在后台跑、不等返回，绝不拖慢 agent；timeout 5s 兜底
-    const on = (matcher) => [{ matcher, hooks: [{ type: 'command', command: `${HOOK_CURL} @- >/dev/null 2>&1 || true`, async: true, timeout: 5 }] }];
+    const on = (matcher) => [{ matcher, hooks: [{ type: 'command', command: hookCmd, async: true, timeout: 5 }] }];
     const hooks = {};
     for (const ev of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Notification', 'Stop', 'SubagentStop', 'SessionEnd']) hooks[ev] = on('*');
     hooks.PostToolUse = on('Edit|Write|MultiEdit|NotebookEdit|Bash');
     fs.writeFileSync(path.join(dir, 'claude-settings.json'), JSON.stringify({ hooks }, null, 2) + '\n');
     // codex 的 notify 是整个数组覆盖：用户 ~/.codex/config.toml 里原有的通知程序（如 Codex Computer Use）
-    // 会被顶掉，所以脚本末尾接力调用它、原参数照传
+    // 会被顶掉，所以脚本末尾接力调用它、原参数照传（mac 沿用 .sh；Windows 走 node 版，.sh 拉不起来）
     const orig = codexUserNotify();
     const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
     const sh = ['#!/bin/sh', '# FanBox 启动时生成：把 Codex notify 事件（JSON 是最后一个参数）转发给 FanBox；$FANBOX_* 来自终端环境',
@@ -66,6 +96,18 @@ function writeHookFiles() {
     const shPath = path.join(dir, 'codex-notify.sh');
     fs.writeFileSync(shPath, sh);
     fs.chmodSync(shPath, 0o755);
+    const jsPath = path.join(dir, 'codex-notify.js');
+    const origLit = JSON.stringify(orig).replace(/</g, '\\u003c');
+    fs.writeFileSync(jsPath, `#!/usr/bin/env node
+// FanBox 启动时生成：Codex notify 转发器（notify 数组 = ["node", 本文件]，末参是事件 JSON）。异常全静默。
+const ORIG = ${origLit};
+const args = process.argv.slice(2);
+const last = args.length ? args[args.length - 1] : '';
+if (process.env.FANBOX_CTL && process.env.FANBOX_CTL_TOKEN && last) {
+  try { require('child_process').spawnSync(process.execPath, [${JSON.stringify(hookJs.replace(/\\/g, '/'))}], { env: process.env, input: last, timeout: 3500 }); } catch { /* */ }
+}
+if (process.platform !== 'win32' && ORIG.length) { try { require('child_process').spawn(ORIG[0], ORIG.slice(1).concat(args), { stdio: 'ignore', detached: true }).unref(); } catch { /* */ } }
+`);
   } catch (e) { console.error('[fanbox] hooks 文件写入失败：', e.message); }
 }
 // 只读 ~/.codex/config.toml 顶层的 notify = ["程序", "参数"…]，粗解析够用（不动这个文件）
@@ -129,10 +171,13 @@ function saveBounds() {
 
 function createWindow() {
   const b = loadBounds();
+  const isWin = process.platform === 'win32';
   win = new BrowserWindow({
     width: b.width, height: b.height, x: b.x, y: b.y,
     minWidth: 920, minHeight: 600,
-    titleBarStyle: 'hiddenInset',
+    // mac：隐藏标题栏留红绿灯位；Windows：隐藏边框 + 系统三键 overlay（右上角原生最小化/最大化/关闭）
+    titleBarStyle: isWin ? 'hidden' : 'hiddenInset',
+    titleBarOverlay: isWin ? { color: '#0b0c0a', symbolColor: '#9aa3b2', height: 38 } : undefined,
     backgroundColor: '#0b0c0a',
     vibrancy: 'sidebar',
     visualEffectState: 'active',
@@ -140,7 +185,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      additionalArguments: [`--fanbox-ctl-token=${AGENT_TOKEN}`], // 渲染层写接口的门票，preload 读 argv 暴露为 fanboxEnv.ctlToken
+      additionalArguments: [`--fanbox-ctl-token=${AGENT_TOKEN}`, `--fanbox-home=${os.homedir().replace(/\\/g, '/')}`], // 渲染层写接口的门票 + home 路径（沙箱 preload 里 require('os') 不可用，只能走 argv）
     },
   });
   // 拖动/缩放后防抖记忆，关窗再存一次兜底
@@ -153,6 +198,21 @@ function createWindow() {
     saveBounds();
     if (process.platform === 'darwin' && !isQuitting) { e.preventDefault(); win.hide(); }
   });
+
+  // Windows：WCO（系统三键）的命中区域在最大化/还原/全屏切换后可能滞留旧坐标——
+  // 表现为一条隐形竖向条带吞掉鼠标（键盘正常），Electron 已知 bug 类。状态变化后强制重建一次。
+  if (process.platform === 'win32') {
+    const refreshOverlay = () => {
+      try {
+        const o = win.getTitleBarOverlay();
+        if (o && o.color) win.setTitleBarOverlay({ color: o.color, symbolColor: o.symbolColor, height: o.height });
+      } catch { /* 重建失败不拦主流程 */ }
+    };
+    win.on('maximize', refreshOverlay);
+    win.on('unmaximize', refreshOverlay);
+    win.on('enter-full-screen', refreshOverlay);
+    win.on('leave-full-screen', refreshOverlay);
+  }
 
   // 等后端起来再加载（首次 listen 有几十毫秒延迟）
   const load = () => win.loadURL(`http://localhost:${PORT}`).catch(() => setTimeout(load, 150));
@@ -305,6 +365,17 @@ let latestAssets = null; // 最新 Release 的资产文件名清单；null = 没
 let updRetry = 0;
 let lastAutoCheck = 0;
 async function checkUpdate(opts) {
+  // Windows 构建：上游 Release 只发 mac 包，应用内更新一律关掉（手动检查给个说明，自动检查静默跳过）
+  if (process.platform === 'win32') {
+    if (opts && opts.manual) {
+      dialog.showMessageBoxSync(win && !win.isDestroyed() ? win : undefined, {
+        type: 'info', buttons: [M('好', 'OK')],
+        message: M('Windows 版暂不提供应用内更新', 'No in-app updates on Windows'),
+        detail: M('这是社区 Windows 构建。新版本请到项目发布页（GitHub Releases）手动下载。', 'This is a community Windows build. Please download new versions from the GitHub releases page.'),
+      });
+    }
+    return;
+  }
   const manual = !!(opts && opts.manual);
   if (!manual) lastAutoCheck = Date.now();
   let info = null;
@@ -458,6 +529,12 @@ ipcMain.handle('win:traffic', (e, { show }) => {
   if (!win || win.isDestroyed() || typeof win.setWindowButtonVisibility !== 'function') return;
   win.setWindowButtonVisibility(!!show);
 });
+// Windows：系统三键（titleBarOverlay）的底色/符号色随皮肤走——写死深色会在暖白主题上成一块黑疤
+ipcMain.handle('win:overlay', (e, { color, symbolColor } = {}) => {
+  if (process.platform !== 'win32' || !win || win.isDestroyed() || typeof win.setTitleBarOverlay !== 'function') return { ok: false };
+  try { win.setTitleBarOverlay({ color, symbolColor }); return { ok: true }; }
+  catch (err) { return { ok: false, error: err.message }; }
+});
 
 // 界面语言：用户手动选过的存在 ~/.fanbox/config.json（渲染层切换时写入），没选过跟随系统
 function uiLang() {
@@ -486,7 +563,7 @@ let wechatStayAwake = false; // 「微信遥控不断线」开关，跨会话持
 let wechatConnected = false; // 微信 ClawBot 当前是否连着（bridge 回调更新）
 
 // ---- agent 工作状态检测：前台不是裸 shell = 终端里有东西在跑（和微信 termControl 同一判据）----
-const BARE_SHELL = /^-?(zsh|bash|sh|fish|login)$/i;
+const BARE_SHELL = /^-?(zsh|bash|sh|fish|login|powershell|pwsh|cmd)(\.exe)?$/i;
 // 正在干活的 agent 终端清单：休眠守卫与退出确认共用同一份判据，两边不会各说各话
 function activeAgentTerms() {
   const out = [];
@@ -839,7 +916,11 @@ function recStop(id) {
 // ---------- 终端 IPC（node-pty）----------
 ipcMain.handle('pty:spawn', (e, { id, cwd, cols, rows, theme }) => {
   if (!pty) return { ok: false, error: 'node-pty 未编译，跑：npm run rebuild' };
-  const shellPath = process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : '/bin/zsh');
+  // Windows：SHELL 可能是 Git Bash 塞进来的 /usr/bin/bash（直接 spawn 必挂），只认 FANBOX_SHELL 覆盖；
+  // mac 沿用 SHELL/login shell
+  const shellPath = process.platform === 'win32'
+    ? (process.env.FANBOX_SHELL || 'powershell.exe')
+    : (process.env.SHELL || '/bin/zsh');
   const startCwd = cwd && fs.existsSync(cwd) ? cwd : os.homedir();
   // login shell（-l）：GUI 启动的进程只继承精简 PATH，不读 .zprofile/.zlogin，
   // 用户在那里配的 Homebrew/nvm/npm 全局路径（claude 等）就丢了 → 「普通终端能找到、fanbox 找不到」。
@@ -863,6 +944,7 @@ ipcMain.handle('pty:spawn', (e, { id, cwd, cols, rows, theme }) => {
     });
   } catch (err) { return { ok: false, error: err.message }; }
   terminals.set(id, p);
+  pidCwd.set(p.pid, startCwd); // Windows 没有 lsof，cwd 就停在初始目录（termCwdByPid 的 win 分支用）
   refreshLidGuard(); // 开关开着时，第一个终端起来即生效
   recStart(id, { cols, rows, cwd: startCwd, theme });
   p.onData((data) => {
@@ -879,6 +961,7 @@ ipcMain.handle('pty:spawn', (e, { id, cwd, cols, rows, theme }) => {
   });
   p.onExit(({ exitCode }) => {
     terminals.delete(id);
+    pidCwd.delete(p.pid);
     termTails.delete(id);
     termBufs.delete(id);
     termLastOut.delete(id);
@@ -923,6 +1006,12 @@ ipcMain.handle('clip:read', () => {
 });
 ipcMain.handle('clip:file', (e, { path: p }) => new Promise((resolve) => {
   const { execFile } = require('child_process');
+  if (process.platform === 'win32') {
+    // Windows：SetFileDropList 进剪贴板，资源管理器/聊天窗口可直接粘贴；-STA 是剪贴板 COM 的硬要求
+    const ps = `Add-Type -AssemblyName System.Windows.Forms; $c = New-Object System.Collections.Specialized.StringCollection; $c.AddRange(@('${String(p).replace(/'/g, "''")}')); [System.Windows.Forms.Clipboard]::SetFileDropList($c)`;
+    execFile('powershell.exe', ['-NoProfile', '-STA', '-Command', ps], { timeout: 10000 }, (err) => resolve({ ok: !err, error: err && err.message }));
+    return;
+  }
   // argv 传路径，避免拼进 AppleScript 字面量被注入
   execFile('osascript', ['-e', 'on run argv', '-e', 'set the clipboard to (POSIX file (item 1 of argv))', '-e', 'end run', p], (err) => resolve({ ok: !err, error: err && err.message }));
 }));
@@ -989,7 +1078,7 @@ ipcMain.on('pty:kill', (e, { id }) => { const p = terminals.get(id); if (p) { tr
 
 // ---------- Agent 控制接口：把跨终端感知/控制能力开成本机 HTTP（server.js 的 /api/agent/* 调这里）----------
 // 让跑在翻箱终端里的 agent 指挥兄弟窗口：列表/读屏/输入/开窗/等待/关闭。安全模型与接口规范见 docs/12。
-const BARE_SHELL_RE = /^-?(zsh|bash|sh|fish|login)$/i;
+const BARE_SHELL_RE = /^-?(zsh|bash|sh|fish|login|powershell|pwsh|cmd)(\.exe)?$/i;
 let agentReqSeq = 0;
 const agentCreateWaiters = new Map(); // reqId -> resolve（渲染进程建 tab 的回执）
 
@@ -1211,6 +1300,11 @@ ipcMain.handle('rec:save-export', (e, { name, buf }) => {
 });
 // 导出：渲染层录出的永远是 WebM；要 MP4/GIF 就用本机 ffmpeg 转一道（检测不到 ffmpeg 优雅退回 WebM）。
 function findFfmpeg() {
+  if (process.platform === 'win32') {
+    // PATH 里有就用（winget/scoop/choco 装的都在 PATH）；ffmpeg.exe 在 System32 没有也无所谓
+    try { const r = require('child_process').execSync('where ffmpeg', { timeout: 4000, encoding: 'utf8' }); const p = String(r).trim().split(/\r?\n/)[0]; if (p) return p; } catch { /* 没装 */ }
+    return null;
+  }
   for (const c of ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']) { try { if (fs.existsSync(c)) return c; } catch { /* */ } }
   return null;
 }
@@ -1296,10 +1390,11 @@ function decodeLsofPath(s) {
   }
   return Buffer.from(bytes).toString('utf8');
 }
-// 取某终端 shell 的真实当前目录（用 lsof 查 pty 子进程的 cwd）
+// 取某终端 shell 的真实当前目录（mac 用 lsof 查 pty 子进程的 cwd；Windows 无此手段，退启动目录）
 function termCwdByPid(pid) {
   return new Promise((resolve) => {
     if (!pid) return resolve('');
+    if (process.platform === 'win32') return resolve(pidCwd.get(pid) || '');
     require('child_process').exec(`lsof -a -p ${pid} -d cwd -Fn`, { env: { ...process.env, LC_ALL: 'en_US.UTF-8' }, timeout: 3000 }, (err, stdout) => {
       if (err) return resolve('');
       const line = (stdout || '').split('\n').find((l) => l.startsWith('n'));
@@ -1324,7 +1419,23 @@ ipcMain.handle('pty:proc', (e, { id }) => {
 // ---------- 微信 ClawBot：不经 openclaw，直连腾讯 iLink 协议 + 本机 claude/codex 无头实例 ----------
 // 编排见 electron/wechat/bridge.js（iLink 客户端 ilink.js + 本机 CLI 驱动 driver.js）。
 // 参考的开源项目与署名见 docs/08-微信ClawBot-参考与署名.md。
-const wechatBridge = require('./wechat/bridge');
+// Windows：driver 靠 POSIX 登录 shell 拉起无头 agent（command -v/-lc/shq 引用），暂不移植——
+// 挂同接口的桩，界面照常显示「未连接」，其余功能不受影响。
+const wechatBridge = process.platform === 'win32' ? {
+  onConnChange: null, termControl: null,
+  init() {}, isConnected() { return false; },
+  env() { return { connected: false, unsupported: true }; },
+  setTarget() { return { ok: false, error: 'unsupported' }; },
+  setCwd() { return { ok: false, error: 'unsupported' }; },
+  setPersona() { return { ok: false, error: 'unsupported' }; },
+  sendDesktop() { return { ok: false, error: 'Windows 版暂未支持微信遥控' }; },
+  conversation() { return { ok: false, error: 'Windows 版暂未支持微信遥控' }; },
+  newConversation() { return { ok: false, error: 'Windows 版暂未支持微信遥控' }; },
+  compact() { return { ok: false, error: 'Windows 版暂未支持微信遥控' }; },
+  login() { return { ok: false, error: 'Windows 版暂未支持微信遥控' }; },
+  disconnect() { return { ok: true }; },
+  check() { return { state: 'disconnected' }; },
+} : require('./wechat/bridge');
 let wechatInited = false;
 function ensureWechat() {
   if (wechatInited) return;
@@ -1338,7 +1449,7 @@ function ensureWechat() {
       for (const [id, p] of terminals) {
         const proc = (p && p.process) || '';
         const cwd = await termCwdByPid(p && p.pid);
-        const busy = !!proc && !/^-?(zsh|bash|sh|fish|login)$/i.test(proc); // 前台不是裸 shell = 正跑着东西
+        const busy = !!proc && !BARE_SHELL_RE.test(proc); // 前台不是裸 shell = 正跑着东西
         arr.push({ id, cwd, name: cwd ? path.basename(cwd) : '', proc, busy, tail: termTails.get(id) || '' });
       }
       return arr;

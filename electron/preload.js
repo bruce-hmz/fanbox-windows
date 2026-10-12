@@ -70,6 +70,7 @@ contextBridge.exposeInMainWorld('fanboxUpdate', {
 contextBridge.exposeInMainWorld('fanboxWin', {
   focus: () => ipcRenderer.invoke('win:focus'), // 点通知拉回前台
   trafficLights: (show) => ipcRenderer.invoke('win:traffic', { show }), // 全屏预览时藏/显左上角系统按钮
+  setOverlay: (colors) => ipcRenderer.invoke('win:overlay', colors), // Windows：三键 overlay 底色随皮肤走
   setBadge: (text) => ipcRenderer.invoke('win:badge', { text }), // Dock 角标：几个会话在等你（空串清掉）
 });
 
@@ -85,6 +86,8 @@ contextBridge.exposeInMainWorld('fanboxAgentCtl', {
 contextBridge.exposeInMainWorld('fanboxEnv', {
   isDesktopApp: true,
   platform: process.platform,
+  // home 由主进程经 additionalArguments 递进来——沙箱 preload 里 require('os') 不可用
+  home: (process.argv.find((a) => a.startsWith('--fanbox-home=')) || '').slice('--fanbox-home='.length),
   // 写类 /api/* 的门票：主进程经 additionalArguments 递进来。preload 只在主框架跑，预览 iframe（跨源）拿不到
   ctlToken: (process.argv.find((a) => a.startsWith('--fanbox-ctl-token=')) || '').slice('--fanbox-ctl-token='.length),
 });

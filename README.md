@@ -1,3 +1,12 @@
+# FanBox for Windows（社区移植版）
+
+> 本仓库是 [alchaincyf/fanbox](https://github.com/alchaincyf/fanbox)（花叔的 vibe coding 驾驶舱，macOS 原生）的 **Windows 移植版**，基于上游 v2.16.1，遵循 MIT 协议，与上游作者无关。
+>
+> **下载**：见 [Releases](../../releases)——NSIS 安装器 + 便携版（未签名，SmartScreen 首次会拦一下，点「仍要运行」）。
+>
+> 与同名社区移植（daodao166888/fanbox-windows 等）互不相干、基线不同。移植改动全量清单与踩坑记录：[WINDOWS-PORT.md](WINDOWS-PORT.md)。macOS 版请回[原仓库](https://github.com/alchaincyf/fanbox)。
+
+---
 <div align="center">
 
 # 📦 FanBox

@@ -14,7 +14,8 @@
     "build:milkdown": "esbuild src-vendor/milkdown-entry.js --bundle --format=iife --minify --outfile=public/vendor/milkdown/milkdown.js --loader:.svg=dataurl --loader:.woff=file --loader:.woff2=file --loader:.ttf=file --loader:.eot=file --asset-names=[name]",
     "build:hljs": "esbuild src-vendor/hljs-entry.js --bundle --format=iife --minify --outfile=public/vendor/hljs/highlight.js && cp node_modules/marked/marked.min.js public/vendor/marked/marked.min.js && cp node_modules/dompurify/dist/purify.min.js public/vendor/dompurify/purify.min.js && cp node_modules/highlight.js/styles/github-dark.min.css node_modules/highlight.js/styles/github.min.css public/vendor/hljs/styles/",
     "dist": "APPLE_KEYCHAIN_PROFILE=fanbox-notary electron-builder --mac --arm64 --publish never",
-    "dist:x64": "PTY_ARCH=x64 npm run rebuild:pty && APPLE_KEYCHAIN_PROFILE=fanbox-notary electron-builder --mac --x64 --publish never && PTY_ARCH=arm64 npm run rebuild:pty"
+    "dist:x64": "PTY_ARCH=x64 npm run rebuild:pty && APPLE_KEYCHAIN_PROFILE=fanbox-notary electron-builder --mac --x64 --publish never && PTY_ARCH=arm64 npm run rebuild:pty",
+    "dist:win": "electron-builder --win --x64 --publish never"
   },
   "build": {
     "appId": "com.huashu.fanbox",
@@ -41,6 +42,7 @@
     "asar": true,
     "npmRebuild": false,
     "asarUnpack": [
+      "**/node_modules/@lydell/node-pty/**",
       "**/node_modules/node-pty/**"
     ],
     "mac": {
@@ -65,16 +67,43 @@
         }
       ]
     },
-    "publish": [
-      {
-        "provider": "github",
-        "owner": "alchaincyf",
-        "repo": "fanbox"
-      }
-    ],
+    "publish": null,
     "dmg": {
       "title": "FanBox",
       "writeUpdateInfo": false
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "FanBox",
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "FanBox-Setup-${version}.${ext}",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico"
+    },
+    "portable": {
+      "artifactName": "FanBox-Portable-${version}.exe"
     }
   },
   "type": "commonjs",
@@ -88,8 +117,8 @@
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
     "electron-updater": "^6.8.9",
-    "node-pty": "^1.0.0",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "@lydell/node-pty": "1.2.0-beta.15"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.7.0",

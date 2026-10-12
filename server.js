@@ -503,7 +503,7 @@ const ORGANIZE_BRIEF_FILE = path.join(CONFIG_DIR, 'organize-brief.md');
 const DEFAULT_ORGANIZE_STRATEGY = `- 默认归档：过时/低频的文件移入 _archive/ 下的语义子目录（如 _archive/截图/2026-06/）
 - 同一主题的散文件归进语义明确的项目文件夹（项目制：一个项目一个文件夹，按需建议新文件夹）
 - 归档之外，单独提一份「建议删除」清单（什么算该删由你判断：明显垃圾、可再生成的产物、过期大文件……），逐条给理由
-- 删除须用户逐条点头；确认后移入废纸篓 ~/.Trash/（不直接 rm），并照常记进回滚日志
+- 删除须用户逐条点头；确认后移入系统回收站/废纸篓（不直接 rm），并照常记进回滚日志
 - 最近 7 天内有动静的文件视为正在进行的工作，不要动
 - 文件夹一律不动，只整理松散文件
 - 拿不准的单独列出来问，宁可少动不要乱动`;
@@ -522,7 +522,48 @@ async function codexOrganizeFlags(bin) {
   return flags;
 }
 
+// Windows 桌面应用探测：开始菜单快捷方式 → 卸载表 DisplayName → PATH，三连查。
+// App Paths 注册表 Windows 软件基本不注册（只查它会把已安装的全误报成「未装」）。
+// 一批应用共用一个 PowerShell 进程，输出按行 JSON。
+function winAppsProbe(apps, out) {
+  const q = (s) => String(s).replace(/'/g, "''");
+  const ps = [
+    "$ErrorActionPreference='SilentlyContinue'",
+    `$names=@(${apps.map((a) => `'${q(a)}'`).join(',')})`,
+    '$roots=@("$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs","$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs")',
+    "$keys=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*')",
+    '$out=@{}',
+    'foreach ($n in $names) {',
+    '  $f=$false',
+    '  foreach ($r in $roots) {',
+    '    if (-not $f) { $x = Get-ChildItem $r -Recurse -Filter "*.lnk" | Where-Object { $_.BaseName -like ($n + "*") } | Select-Object -First 1; if ($x) { $f=$true } }',
+    '  }',
+    '  if (-not $f) { $p = Get-ItemProperty $keys | Where-Object { $_.DisplayName -like ($n + "*") } | Select-Object -First 1; if ($p) { $f=$true } }',
+    '  if (-not $f) { if (Get-Command $n -ErrorAction SilentlyContinue) { $f=$true } }',
+    '  $out[$n] = $f',
+    '}',
+    '$out | ConvertTo-Json -Compress',
+  ].join('\r\n');
+  return new Promise((resolve) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 20000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+      let parsed = null;
+      try { parsed = JSON.parse(String(stdout || '')); } catch { /* 探测失败按未装处理 */ }
+      for (const a of apps) out[a] = parsed ? parsed[a] === true : false;
+      resolve();
+    });
+  });
+}
+
 async function findAgentBin(name) {
+  // Windows：where.exe 直接在系统 PATH 里找（claude/codex 一般是 npm 全局的 .cmd）
+  if (PLATFORM === 'win32') {
+    return new Promise((resolve) => {
+      execFile('where', [name], { timeout: 8000 }, (err, stdout) => {
+        const out = String(stdout || '').trim().split(/\r?\n/)[0];
+        resolve(!err && out ? out : null);
+      });
+    });
+  }
   // GUI 启动的 app 没有用户 shell 的 PATH，走登录 shell 找一次绝对路径
   return new Promise((resolve) => {
     execFile('/bin/zsh', ['-lc', `command -v ${name}`], { timeout: 8000 }, (err, stdout) => {
@@ -603,7 +644,15 @@ ${history || '（还没有历史记录）'}
 // 两份文件由桌面主进程启动时写到 ~/.fanbox/hooks/；网页版没有它们就裸跑（claude 遇到不存在的 --settings 会报错退出）
 const HOOKS_DIR = path.join(HOME, '.fanbox', 'hooks');
 function claudeHooksFlag() { const f = path.join(HOOKS_DIR, 'claude-settings.json'); return fs.existsSync(f) ? ` --settings "${f}"` : ''; }
-function codexHooksFlag() { const f = path.join(HOOKS_DIR, 'codex-notify.sh'); return fs.existsSync(f) ? ` -c 'notify=["${f}"]'` : ''; }
+function codexHooksFlag() {
+  // Windows：.sh 拉不起来，notify 走 node 脚本；路径一律正斜杠（JSON 字符串里反斜杠是非法转义）
+  if (PLATFORM === 'win32') {
+    const f = path.join(HOOKS_DIR, 'codex-notify.js').replace(/\\/g, '/');
+    return fs.existsSync(f) ? ` -c "notify=[\\"node\\",\\"${f}\\"]"` : '';
+  }
+  const f = path.join(HOOKS_DIR, 'codex-notify.sh');
+  return fs.existsSync(f) ? ` -c 'notify=["${f}"]'` : '';
+}
 
 // ---------- 发版向导：检查项目状态 → 改版本号/CHANGELOG → 命令序列交给内嵌终端跑（每步可见可拦）----------
 async function releaseInspect(p) {
@@ -619,7 +668,9 @@ async function releaseInspect(p) {
   const status = await sh('git', ['status', '--porcelain']);
   out.isRepo = status !== null;
   out.dirty = !!(status && status.length);
-  out.gh = !!(await sh('/bin/sh', ['-lc', 'command -v gh']));
+  out.gh = PLATFORM === 'win32'
+    ? !!(await sh('where', ['gh']))
+    : !!(await sh('/bin/sh', ['-lc', 'command -v gh']));
   out.unreleased = ''; out.hasChangelog = false;
   try {
     const cl = await fsp.readFile(path.join(dir, 'CHANGELOG.md'), 'utf8');
@@ -1485,7 +1536,14 @@ function openInOS(target, withApp) {
       const dir = (() => { try { return fs.statSync(target).isDirectory() ? target : path.dirname(target); } catch { return path.dirname(target); } })();
       let tBin, tArgs;
       if (PLATFORM === 'darwin') { tBin = 'open'; tArgs = ['-a', 'Terminal', dir]; }
-      else if (PLATFORM === 'win32') { tBin = 'cmd.exe'; tArgs = ['/c', 'start', '', 'cmd', '/K', 'cd', '/d', dir]; }
+      else if (PLATFORM === 'win32') {
+        // 优先 Windows Terminal，没装再退 cmd
+        execFile('wt.exe', ['-d', dir], (err) => {
+          if (!err) return resolve({ ok: true, with: 'terminal' });
+          execFile('cmd.exe', ['/c', 'start', '', 'cmd', '/K', 'cd', '/d', dir], (err2) => resolve(err2 ? { ok: false, error: err2.message } : { ok: true, with: 'terminal' }));
+        });
+        return;
+      }
       else { tBin = 'sh'; tArgs = ['-c', 'x-terminal-emulator --working-directory="$1" || gnome-terminal --working-directory="$1" || xterm', '--', dir]; }
       execFile(tBin, tArgs, (err) => resolve(err ? { ok: false, error: err.message } : { ok: true, with: 'terminal' }));
       return;
@@ -1585,8 +1643,11 @@ function run(cmd, args) {
   });
 }
 // 图片走 sips 缩放（快）；视频/PDF/其它走 qlmanage QuickLook 抽帧
+// Windows：没有 sips/qlmanage，走常驻 PowerShell 工作器（Shell 缩略图工厂能出视频/PDF 的真缩略图，
+// System.Drawing 兜底纯图片）。替代 mac 上「fork 一次进程」的模型——工作器常驻摊薄 Add-Type 编译成本。
 async function generateThumb(src, e, size, cacheFile, isImg) {
   await fsp.mkdir(THUMB_DIR, { recursive: true });
+  if (PLATFORM === 'win32') return winThumb(src, cacheFile, size);
   if (isImg) {
     const fmt = cacheFile.endsWith('.png') ? 'png' : 'jpeg';
     await run('sips', ['-s', 'format', fmt, '-Z', String(size), src, '--out', cacheFile]);
@@ -1600,6 +1661,139 @@ async function generateThumb(src, e, size, cacheFile, isImg) {
     if (!png) throw new Error('no thumb');
     await fsp.rename(path.join(tmpDir, png), cacheFile);
   } finally { fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {}); }
+}
+
+// ---------- Windows 缩略图工作器：常驻 powershell，stdin/stdout 按行 JSON 通信 ----------
+// 路径走 base64（UTF-8 中文名不经过 console 编码这个坑）；一次一请求，Node 侧串行排队。
+// PowerShell 脚本经 -EncodedCommand 注入，绕开全部引号转义问题。
+const WIN_THUMB_PS = `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class FBThumb {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct SIZE { public int cx; public int cy; public SIZE(int x, int y) { cx = x; cy = y; } }
+  [ComImport, Guid("bcc18b79-ba16-442f-80c4-8a59c30c463b"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IShellItemImageFactory {
+    void GetImage(SIZE size, int flags, out IntPtr phbm);
+  }
+  [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+  public static extern void SHCreateItemFromParsingName(string pszPath, IntPtr pbc, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out IShellItemImageFactory ppv);
+  [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr hObject);
+}
+"@
+function Save-Scaled([System.Drawing.Image]$img, [string]$out, [int]$size, [bool]$png) {
+  $scale = [Math]::Min(1.0, [Math]::Min($size / [double]$img.Width, $size / [double]$img.Height))
+  $w = [Math]::Max(1, [int]([Math]::Round($img.Width * $scale)))
+  $h = [Math]::Max(1, [int]([Math]::Round($img.Height * $scale)))
+  $bmp = New-Object System.Drawing.Bitmap($w, $h)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+  if (-not $png) { $g.Clear([System.Drawing.Color]::White) }
+  $g.DrawImage($img, 0, 0, $w, $h)
+  $g.Dispose()
+  if ($png) { $bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png) }
+  else {
+    $enc = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
+    $ep = New-Object System.Drawing.Imaging.EncoderParameters(1)
+    $ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]82)
+    $bmp.Save($out, $enc, $ep)
+  }
+  $bmp.Dispose()
+}
+$guid = [Guid]'bcc18b79-ba16-442f-80c4-8a59c30c463b'
+while ($true) {
+  $line = [Console]::In.ReadLine()
+  if ($null -eq $line) { break }
+  if (-not $line.Trim()) { continue }
+  try { $req = $line | ConvertFrom-Json } catch { [Console]::Out.WriteLine('{"id":-1,"ok":false}'); continue }
+  $src = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($req.src))
+  $out = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($req.out))
+  $size = [int]$req.size
+  $png = ($req.png -eq 1)
+  $ok = $false
+  try {
+    # 1) Shell 缩略图工厂：视频/PDF/图片都出 Explorer 同款真缩略图
+    $f = $null
+    [FBThumb]::SHCreateItemFromParsingName($src, [IntPtr]::Zero, [ref]$guid, [ref]$f)
+    if ($f -ne $null) {
+      $hbm = [IntPtr]::Zero
+      $f.GetImage([FBThumb+SIZE]::new($size, $size), 1, [ref]$hbm)
+      if ($hbm -ne [IntPtr]::Zero) {
+        $big = [System.Drawing.Image]::FromHbitmap($hbm)
+        [FBThumb]::DeleteObject($hbm) | Out-Null
+        Save-Scaled $big $out $size $png
+        $big.Dispose()
+        $ok = $true
+      }
+    }
+  } catch { $ok = $false }
+  if (-not $ok -and $png) {
+    try {
+      # 2) System.Drawing 直读：Shell 不认的图片格式退这条路（png 透明得以保留）
+      $img = [System.Drawing.Image]::FromFile($src)
+      Save-Scaled $img $out $size $png
+      $img.Dispose()
+      $ok = $true
+    } catch { $ok = $false }
+  }
+  $r = @{ id = [int]$req.id; ok = $ok } | ConvertTo-Json -Compress
+  [Console]::Out.WriteLine($r)
+}
+`;
+let thumbWorker = null;      // ChildProcess
+let thumbWorkerBuf = '';     // stdout 半行缓冲
+let thumbWorkerQueue = Promise.resolve();
+const thumbWorkerPending = new Map(); // id -> { resolve, timer }
+let thumbWorkerSeq = 0;
+function winThumbKill() {
+  if (!thumbWorker) return;
+  const p = thumbWorker; thumbWorker = null; thumbWorkerBuf = '';
+  try { p.kill(); } catch { /* */ }
+  for (const [id, w] of thumbWorkerPending) {
+    clearTimeout(w.timer);
+    thumbWorkerPending.delete(id);
+    w.reject(new Error('thumb worker died'));
+  }
+}
+function winThumbRaw(src, out, size, png) {
+  return new Promise((resolve, reject) => {
+    if (!thumbWorker) {
+      thumbWorker = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-EncodedCommand', Buffer.from(WIN_THUMB_PS, 'utf16le').toString('base64')],
+        { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+      thumbWorker.on('error', () => winThumbKill());
+      thumbWorker.on('exit', () => winThumbKill());
+      thumbWorker.stdout.on('data', (d) => {
+        thumbWorkerBuf += String(d);
+        let nl;
+        while ((nl = thumbWorkerBuf.indexOf('\n')) >= 0) {
+          const line = thumbWorkerBuf.slice(0, nl).trim();
+          thumbWorkerBuf = thumbWorkerBuf.slice(nl + 1);
+          if (!line) continue;
+          try {
+            const m = JSON.parse(line);
+            const w = thumbWorkerPending.get(m.id);
+            // 注意用 pending 条目里存的 resolver——闭包里的 resolve/reject 只属于第一个请求
+            if (w) { clearTimeout(w.timer); thumbWorkerPending.delete(m.id); m.ok ? w.resolve() : w.reject(new Error('no thumb')); }
+          } catch { /* 坏行忽略 */ }
+        }
+      });
+    }
+    const id = ++thumbWorkerSeq;
+    const timer = setTimeout(() => { thumbWorkerPending.delete(id); winThumbKill(); reject(new Error('thumb timeout')); }, 20000);
+    thumbWorkerPending.set(id, { resolve, reject, timer });
+    const payload = JSON.stringify({ id, src: Buffer.from(src, 'utf8').toString('base64'), out: Buffer.from(out, 'utf8').toString('base64'), size, png: png ? 1 : 0 });
+    thumbWorker.stdin.write(payload + '\n');
+  });
+}
+function winThumb(src, out, size) {
+  // 单工作器顺序处理，天然限流；某个请求超时/崩掉时工作器会重建，后续照常
+  const png = ALPHA_IMG_EXT.has(ext(src));
+  thumbWorkerQueue = thumbWorkerQueue.then(() => winThumbRaw(src, out, size, png), () => {});
+  return thumbWorkerQueue;
 }
 // 缩略图缓存按总体积上限做 LRU 裁剪（同一文件改一次就多一个缓存键，不清会无限涨）
 async function pruneThumbs(maxBytes = 400 * 1024 * 1024) {
@@ -1933,7 +2127,7 @@ async function parseClaudeFile(file, stat) {
     if (m.id && m.id === c.lastMsgId) continue; // 同一条消息分多行落盘，usage 重复：只记第一次
     if (m.id) c.lastMsgId = m.id;
     const t = Date.parse(d.timestamp || '') || stat.mtimeMs;
-    c.events.push({ t, in: u.input_tokens || 0, out: u.output_tokens || 0, cc: u.cache_creation_input_tokens || 0, cr: u.cache_read_input_tokens || 0 });
+    c.events.push({ t, in: u.input_tokens || 0, out: u.output_tokens || 0, cc: u.cache_creation_input_tokens || 0, cr: u.cache_read_input_tokens || 0, cwd: d.cwd || '', model: m.model || '' });
   }
   return c.events;
 }
@@ -2049,6 +2243,25 @@ async function claudeOAuthToken() {
 // curl 直连 api.anthropic.com 会被 403 地域拦截。此时读 macOS 系统代理（Clash 等都会写进去）兜底。
 async function curlSysProxyLine() {
   if (['https_proxy', 'HTTPS_PROXY', 'http_proxy', 'HTTP_PROXY', 'all_proxy', 'ALL_PROXY'].some((k) => process.env[k])) return '';
+  // Windows：读 Internet 设置注册表（Clash 等开启系统代理时写这里）
+  if (PLATFORM === 'win32') {
+    try {
+      const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
+      const q = (v) => new Promise((resolve) => execFile('reg', ['query', key, '/v', v], { timeout: 3000 }, (err, stdout) => resolve(err ? '' : String(stdout))));
+      const [en, ps] = [await q('ProxyEnable'), await q('ProxyServer')];
+      if (!/0x1\b/.test(en)) return '';
+      const m = ps.match(/REG_SZ\s+(\S+)/);
+      if (!m) return '';
+      const val = m[1];
+      if (val.includes('=')) {
+        // 按协议分写的形态：http=127.0.0.1:7890;https=...
+        const https = val.match(/(?:^|;)https=([^;]+)/i) || val.match(/(?:^|;)http=([^;]+)/i);
+        return https ? `proxy = "http://${https[1]}"\n` : '';
+      }
+      return `proxy = "http://${val}"\n`;
+    } catch { /* 读不到就直连 */ }
+    return '';
+  }
   if (PLATFORM !== 'darwin') return '';
   try {
     const out = await new Promise((resolve, reject) => {
@@ -2524,6 +2737,56 @@ async function agentUsage() {
   return data;
 }
 
+// ---------- 实时速率（DSH token-meter 思路的移植）：Claude 会话 jsonl 实时逐条追加，
+// 每条 assistant 事件自带时间戳与 usage → 增量尾读后按滑动窗口聚合。
+// 没有流式 chunk 可看（agent 是外部 CLI），「近 60 秒窗口 + 每分钟柱状」是这套架构下的等价实时口径。
+// 1s 缓存：前端 2s 轮询，event loop 上只是一次数组遍历，代价可忽略。
+const agentRateCache = { at: 0, data: null };
+async function agentRate() {
+  if (agentRateCache.data && Date.now() - agentRateCache.at < 1000) return agentRateCache.data;
+  const cutoff = Date.now() - 8 * 86400000;
+  const files = [];
+  let dirs;
+  try { dirs = await fsp.readdir(CLAUDE_PROJ); } catch { return null; }
+  await Promise.all(dirs.map(async (d) => {
+    let names;
+    try { names = await fsp.readdir(path.join(CLAUDE_PROJ, d)); } catch { return; }
+    await Promise.all(names.filter((n) => n.endsWith('.jsonl')).map(async (n) => {
+      const fp = path.join(CLAUDE_PROJ, d, n);
+      try { const st = await fsp.stat(fp); if (st.mtimeMs >= cutoff) files.push({ fp, st }); } catch { /* */ }
+    }));
+  }));
+  const now = Date.now();
+  // 分桶口径（对齐 DSH token-meter 的诚实原则）：out=真实生成，in/cc/cr=上下文重发（缓存读占大头）。
+  // 把四者加总当「速率」会虚高一个数量级——用户看到的应该先是生成速度，上下文量单独标注。
+  const win60 = { tok: 0, out: 0, in: 0, cc: 0, cr: 0, reqs: 0 };
+  const buckets = new Array(10).fill(0);   // 每分钟总处理量 [0]=9~10分钟前 … [9]=最近1分钟
+  const bucketsOut = new Array(10).fill(0); // 每分钟真实输出（柱状图按它画，才是「速度」）
+  const sessions = new Map(); // cwd -> 最近事件时间
+  for (const { fp, st } of files) {
+    let evs;
+    try { evs = await parseClaudeFile(fp, st); } catch { continue; }
+    for (const e of evs) {
+      const age = now - e.t;
+      if (age > 600000) continue; // 柱状图只看近 10 分钟，更早的跳过
+      const tok = e.in + e.out + e.cc + e.cr;
+      const bi = 9 - Math.floor(age / 60000);
+      buckets[bi] += tok;
+      bucketsOut[bi] += e.out;
+      if (age < 60000) { win60.tok += tok; win60.in += e.in; win60.out += e.out; win60.cc += e.cc; win60.cr += e.cr; win60.reqs++; }
+      if (age < 90000 && e.cwd) sessions.set(e.cwd, e.t);
+    }
+  }
+  const active = [...sessions.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([cwd, t]) => ({ name: path.basename(cwd) || cwd, t }));
+  const data = { ok: true, at: now, win60, buckets, bucketsOut, active };
+  agentRateCache.data = data;
+  agentRateCache.at = now;
+  return data;
+}
+
 // ---------- 路由 ----------
 
 // 只接受指向本机回环地址的 Host。挡住 DNS rebinding：恶意网页把自己的域名重绑定到
@@ -2956,11 +3219,12 @@ const server = http.createServer(async (req, res) => {
         .map((s) => s.trim()).filter((s) => /^[A-Za-z0-9._-]{1,64}$/.test(s)).slice(0, 32);
       const apps = String(url.searchParams.get('apps') || '').split(',')
         .map((s) => s.trim()).filter((s) => /^[\w .-]{1,64}$/.test(s)).slice(0, 32);
+      if (PLATFORM === 'win32' && apps.length) await winAppsProbe(apps, out);
       await Promise.all([
         ...bins.map(async (b) => { out[b] = !!(await findAgentBin(b)); }),
-        ...apps.map((a) => new Promise((resolve) => {
+        ...(PLATFORM === 'win32' ? [] : apps.map((a) => new Promise((resolve) => {
           execFile('/usr/bin/open', ['-Ra', a], { timeout: 8000 }, (err) => { out[a] = !err; resolve(); });
-        })),
+        }))),
       ]);
       return sendJSON(res, 200, out);
     }
@@ -2992,6 +3256,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/api/agent-usage') {
       return sendJSON(res, 200, await agentUsage());
+    }
+    if (p === '/api/agent-rate') {
+      return sendJSON(res, 200, await agentRate());
     }
     if (p === '/api/favorites') {
       if (req.method === 'POST') {

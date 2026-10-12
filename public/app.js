@@ -1261,7 +1261,7 @@ function buildImageEditor(e, img) {
       </div>
       <input type="color" id="ie-color" value="#ff3b30" title="颜色">
       <span class="ie-thick" title="粗细"><input type="range" id="ie-size" min="1" max="60" value="5"><i id="ie-dot"></i></span>
-      <button id="ie-undo" class="ghost-btn" title="撤销 ⌘Z">撤销</button>
+      <button id="ie-undo" class="ghost-btn" title="撤销 (Ctrl+Z)">撤销</button>
     </div>
     <div class="imgedit-canvas-wrap"><canvas id="ie-canvas"></canvas></div>
     <div class="imgedit-export">
@@ -1491,8 +1491,8 @@ async function enterEditMode(e) {
   dirtyCheck = null;
   // 代码/文本编辑器顶部：撤销 / 重做两个小图标（按可用性灰显）+ 自动保存状态（和 md 一致，不再有「保存 / 完成」）
   const editorBar =
-    `<div class="editor-bar"><button id="ed-undo" class="ghost-btn" title="撤销 ⌘Z" disabled>${ic('undo', 'currentColor', 15)}</button>` +
-    `<button id="ed-redo" class="ghost-btn" title="重做 ⇧⌘Z" disabled>${ic('redo', 'currentColor', 15)}</button>` +
+    `<div class="editor-bar"><button id="ed-undo" class="ghost-btn" title="撤销 (Ctrl+Z)" disabled>${ic('undo', 'currentColor', 15)}</button>` +
+    `<button id="ed-redo" class="ghost-btn" title="重做 (Ctrl+Shift+Z)" disabled>${ic('redo', 'currentColor', 15)}</button>` +
     `<span id="ed-status" class="editor-hint">自动保存</span></div>`;
 
   if (await mona.load()) {
@@ -1727,7 +1727,7 @@ async function mdEditor(e, data, mode = 'rich') {
     const seg = (id, label, on) =>
       `<button class="seg-btn${m === id ? ' active' : ''}" data-m="${id}"${on ? '' : ' disabled title="此文件含富文本无法无损保存的语法，改请用源码"'}>${label}</button>`;
     const hint = m === 'read' ? (forceCode ? '此文件用源码模式编辑' : '只读 · 要改请点富文本或源码')
-      : '自动保存 · ⌘S 立即保存';
+      : '自动保存 · Ctrl+S 立即保存';
     // 插入图片：source/rich 都能用，唯独只读（有损文件的兜底阅读态）没意义，不给按钮添乱
     const insImgBtn = m !== 'read' ? `<button id="ed-insimg-btn" class="ghost-btn" type="button">+ 插入图片</button>` : '';
     body.innerHTML =
@@ -2894,19 +2894,28 @@ const wechatView = {
 // 桌面版拉起的 claude / codex 带上官方 hooks（主进程启动时写到 ~/.fanbox/hooks/），agent 自己汇报忙/等确认/收工，
 // 不再靠刮终端文本。$HOME 交给 shell 展开；网页版没有这份文件（claude 遇到不存在的 --settings 会报错），保持裸命令。
 // config.json 里用户自定义的 agents 命令原样生效，不带 hooks 就退回旧的刮屏判定
-const CLAUDE_HOOKS = window.fanboxEnv ? ' --settings "$HOME/.fanbox/hooks/claude-settings.json"' : '';
-const CODEX_HOOKS = window.fanboxEnv ? ' -c "notify=[\\"$HOME/.fanbox/hooks/codex-notify.sh\\"]"' : '';
+// hooks 用绝对路径（fanboxEnv.home 换正斜杠）：Windows 终端里 $HOME 展开/引号规则不可靠；codex notify 统一走 node 转发器
+// hooks 用绝对路径（fanboxEnv.home 换正斜杠）：Windows 终端里 $HOME 展开/引号规则都不可靠；codex notify 统一走 node 转发器
+const FB_HOOKS_DIR = window.fanboxEnv ? String(window.fanboxEnv.home || '').replace(/\\/g, '/') : '';
+const CLAUDE_HOOKS = window.fanboxEnv ? ` --settings "${FB_HOOKS_DIR}/.fanbox/hooks/claude-settings.json"` : '';
+const CODEX_HOOKS = window.fanboxEnv ? ` -c "notify=[\\"node\\",\\"${FB_HOOKS_DIR}/.fanbox/hooks/codex-notify.js\\"]"` : '';
+const FB_IS_WIN = !!(window.fanboxEnv && window.fanboxEnv.platform === 'win32');
+// 桌面应用型 agent 的拉起命令：mac 走 open -a；Windows 在 PowerShell 里找开始菜单快捷方式再 Invoke-Item
+// （直接敲进终端的单行命令，不用嵌套引号包一层 powershell -Command）
+const openAppCmd = (name) => FB_IS_WIN
+  ? `$l = Get-ChildItem "$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs","$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs" -Recurse -Filter '${name}*.lnk' | Select-Object -First 1; if ($l) { Invoke-Item $l.FullName } else { Write-Host '未找到 ${name}，请确认已安装' }`
+  : `open -a ${name}`;
 const AGENT_REGISTRY = [
   { id: 'claude', label: 'Claude Code', cmd: 'claude --dangerously-skip-permissions' + CLAUDE_HOOKS, bin: 'claude', install: 'npm install -g @anthropic-ai/claude-code', sessions: { badge: 'C', resumeCmd: 'claude --dangerously-skip-permissions' + CLAUDE_HOOKS + ' --resume {id}' } },
   { id: 'codex', label: 'Codex', cmd: 'codex' + CODEX_HOOKS, bin: 'codex', install: 'npm install -g @openai/codex', sessions: { badge: '>_', resumeCmd: 'codex' + CODEX_HOOKS + ' resume {id}' } },
   { id: 'hermes', label: 'Hermes Agent', cmd: 'hermes', bin: 'hermes', install: 'curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash' },
   { id: 'openclaw', label: 'OpenClaw', cmd: 'openclaw', bin: 'openclaw', install: 'npm install -g openclaw' },
   { id: 'kimi', label: 'Kimi Code', cmd: 'kimi', bin: 'kimi', install: 'curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash', sessions: { badge: 'K', resumeCmd: 'kimi -S {id}' } },
-  { id: 'zcode', label: 'ZCode', cmd: 'open -a ZCode', app: 'ZCode', install: 'https://zcode.z.ai （桌面应用，官网下载 dmg）' },
+  { id: 'zcode', label: 'ZCode', cmd: openAppCmd('ZCode'), app: 'ZCode', install: 'https://zcode.z.ai （桌面应用，官网下载' + (FB_IS_WIN ? '安装包' : ' dmg') + '）' },
   { id: 'opencode', label: 'opencode', cmd: 'opencode', bin: 'opencode', install: 'curl -fsSL https://opencode.ai/install | bash', sessions: { badge: 'oc', resumeCmd: 'opencode -s {id}' } },
   { id: 'pi', label: 'pi', cmd: 'pi', bin: 'pi', install: 'curl -fsSL https://pi.dev/install.sh | sh' },
   { id: 'codebuddy', label: 'CodeBuddy', cmd: 'codebuddy', bin: 'codebuddy', install: 'npm install -g @tencent-ai/codebuddy-code' },
-  { id: 'workbuddy', label: 'WorkBuddy', cmd: 'open -a WorkBuddy', app: 'WorkBuddy', install: 'https://codebuddy.cn/work （桌面应用，官网下载）' },
+  { id: 'workbuddy', label: 'WorkBuddy', cmd: openAppCmd('WorkBuddy'), app: 'WorkBuddy', install: 'https://codebuddy.cn/work （桌面应用，官网下载）' },
   { id: 'qoder', label: 'Qoder CLI', cmd: 'qodercli', bin: 'qodercli', install: 'curl -fsSL https://qoder.com/install | bash' },
 ];
 const AGENT_DEFAULTS = ['claude', 'codex'];
@@ -3093,7 +3102,7 @@ function bindEvents() {
   // 终端「…」：低频工具按当前状态给动词，菜单项自己说明会发生什么
   $('#term-more').onclick = (ev) => (ev.stopPropagation(), popupMenuAt(ev.currentTarget, [
     { label: follow.on ? '停止文件跟随' : '开启文件跟随', fn: () => setFileFollow(!follow.on) },
-    { label: term.maximized ? '还原终端（⌘⇧M）' : '终端铺满（⌘⇧M）', fn: () => term.toggleMax() },
+    { label: term.maximized ? '还原终端（Ctrl+Shift+M）' : '终端铺满（Ctrl+Shift+M）', fn: () => term.toggleMax() },
     { label: term.dock === 'bottom' ? '布局改为左右' : '布局改为上下', fn: () => term.setDock(term.dock === 'bottom' ? 'right' : 'bottom') },
     { label: state.muted ? '开启提示音' : '关闭提示音', fn: () => { state.muted = !state.muted; localStorage.setItem('fb_muted', state.muted ? '1' : '0'); if (!state.muted) playChime('tick'); } },
     { label: '终端录像', fn: () => player.open() },
@@ -3230,7 +3239,7 @@ function bindEvents() {
     const lbOpen = !!document.querySelector('.lightbox');
     if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); cmdkOpen ? cmdk.close() : cmdk.open(); return; }
     // ⌘⇧M 终端铺满/还原（只认 ⌘，Ctrl 组合留给终端里的 TUI）；终端收着时先打开再铺满
-    if (e.metaKey && e.shiftKey && (e.key === 'm' || e.key === 'M')) {
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === 'm' || e.key === 'M')) {
       if (!term.available()) return; // 浏览器版没有内嵌终端
       e.preventDefault();
       if ($('#terminal-panel').classList.contains('hidden')) { term.open(); term.toggleMax(true); }
@@ -3335,6 +3344,20 @@ function applyTheme(skin, rerender = true) {
       if (e) openPreview(e);
     }
   }
+  syncWinOverlay();
+}
+
+// Windows：三键 overlay 的底色跟顶栏走。每次换肤后读计算样式推给主进程 setTitleBarOverlay；
+// 浏览器版/非 Windows 没有 fanboxWin.setOverlay，直接跳过
+function syncWinOverlay() {
+  try {
+    if (!(window.fanboxWin && window.fanboxWin.setOverlay)) return;
+    const tb = document.getElementById('topbar');
+    if (!tb) return;
+    const bg = getComputedStyle(tb).backgroundColor;
+    const sym = getComputedStyle(document.documentElement).getPropertyValue('--text-dim').trim() || '#888888';
+    window.fanboxWin.setOverlay({ color: bg, symbolColor: sym });
+  } catch { /* 皮肤同步失败不影响主流程 */ }
 }
 
 // ---------- 终端录像回放（黑匣子的播放端）----------
@@ -4504,6 +4527,11 @@ const term = {
     this.persistTabs(); // 标签的增删/切换/换目录都路过这里，顺手落快照供下次启动还原
     const bar = $('#term-tabs');
     bar.innerHTML = '';
+    bar.classList.toggle('crowded', this.sessions.length > 5); // 拥挤模式：收窄内边距给关闭钮留位
+    bar.onwheel = (e) => { // 溢出的标签原本只能最大化窗口才够得着——滚轮直接横滚
+      if (bar.scrollWidth <= bar.clientWidth) return;
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) { bar.scrollLeft += e.deltaY; e.preventDefault(); }
+    };
     this.sessions.forEach((s) => {
       const t = document.createElement('div');
       const dotState = s.dead ? 'dead' : (s.status === 'busy' ? 'busy' : 'idle');
@@ -4519,6 +4547,17 @@ const term = {
       t.innerHTML = `<span class="tab-dot ${dotState}" title="${dotTitle}"></span>${eye}${zap}${ic('term', `hsl(${hue} 62% 48%)`, 12)}<span>${escapeHtml(s.title)}</span><span class="tab-x" title="关闭">✕</span>`;
       t.onclick = (e) => { if (e.target.classList.contains('tab-x')) { this.closeTab(s.id); return; } this.activate(s.id); };
       t.ondblclick = (e) => { if (e.target.classList.contains('tab-x')) return; this.locateCwd(); };
+      t.onauxclick = (e) => { if (e.button === 1) { e.preventDefault(); this.closeTab(s.id); } }; // 中键关闭：浏览器/终端通用约定
+      t.oncontextmenu = (e) => {  // 右键菜单：标签被挤瘦后 ✕ 不好点，关闭的入口不能只有那一个小叉
+        e.preventDefault();
+        const others = this.sessions.filter((x) => x.id !== s.id);
+        popupMenuAt(t, [
+          { label: '关闭', fn: () => this.closeTab(s.id) },
+          ...(others.length ? [{ label: '关闭其他（' + others.length + ' 个）', fn: () => others.forEach((x) => this.closeTab(x.id)) }] : []),
+          ...(this.sessions.length > 1 ? [{ label: '全部关闭', fn: () => [...this.sessions].forEach((x) => this.closeTab(x.id)) }] : []),
+          { label: '复制路径', fn: () => { try { navigator.clipboard.writeText(s.cwd || s.startDir || ''); toast('已复制终端路径'); } catch { /* */ } } },
+        ]);
+      };
       bar.appendChild(t);
     });
     roster.render(); // 标签的每次变化指挥台都跟着重画（状态/标题/增删）
@@ -4666,7 +4705,7 @@ const usagePanel = {
   render(d) {
     const box = $('#usage-body');
     if (!d || !d.ok) { box.innerHTML = '<div class="usage-sub">读取失败</div>'; return; }
-    let h = '';
+    let h = '<div id="usage-live" class="usage-live"></div>';
     if (d.codex) {
       const c = d.codex;
       h += `<div class="usage-agent">Codex${c.planType ? ` <i class="usage-plan">${escapeHtml(c.planType)}</i>` : ''}</div>`;
@@ -4689,12 +4728,31 @@ const usagePanel = {
           <span><b>${this.fmtTok(c.today.total)}</b>今日</span>
           <span><b>${this.fmtTok(c.week.total)}</b>本周</span>
         </div>
-        <div class="usage-sub">token 总量 · 本地会话日志统计</div>`;
+        <div class="usage-sub">token 总量（含缓存读写）· 本地会话日志统计</div>`;
       }
     }
     if (!d.codex && !d.claude) h = '<div class="usage-sub">没找到 Claude Code / Codex 的本机会话记录</div>';
     box.innerHTML = h;
   },
+  liveTimer: null,
+  // 实时速率：借 DSH token-meter 的「滑动窗口」口径，数据源是 Claude 会话 jsonl 的实时追加
+  async refreshLive() {
+    const box = $('#usage-live');
+    if (!box) { this.stopLive(); return; }
+    let r = null;
+    try { r = await api('/api/agent-rate'); } catch { return; } // 拉不到就保持旧内容
+    if (!r || !r.ok) return;
+    const w = r.win60;
+    const ctx = w.in + w.cc + w.cr;
+    const p1 = '<div class="usage-live-head"><span class="live-dot' + (w.reqs ? ' on' : '') + '"></span>实时 · 近1分钟 输出 <b>' + this.fmtTok(w.out) + '</b> tok' + (w.out ? '（≈' + Math.round(w.out / 60) + ' tok/s）' : '') + ' · <b>' + w.reqs + '</b> 次调用' + (ctx ? ' · 上下文 ' + this.fmtTok(ctx) + (w.cr ? '（缓存读 ' + this.fmtTok(w.cr) + '）' : '') : '') + '</div>';
+    const bo = r.bucketsOut || r.buckets;
+    const max = Math.max(...bo, 1);
+    const p2 = '<div class="usage-bars">' + bo.map((v, i) => '<i class="' + (i === 9 && v ? 'now' : '') + '" style="height:' + (v ? Math.max(12, Math.round(v / max * 100)) : 3) + '%" title="' + (9 - i) + '分钟前 输出 ' + this.fmtTok(v) + ' / 共 ' + this.fmtTok(r.buckets[i]) + ' tok"></i>').join('') + '</div>';
+    const p3 = '<div class="usage-sub">' + (r.active.length ? '在跑：' + r.active.map((a) => escapeHtml(a.name)).join('、') : (r.win60.reqs ? '&nbsp;' : '近10分钟无调用 · 跑一次 agent 数字就跳起来')) + '</div>';
+    box.innerHTML = p1 + p2 + p3;
+  },
+  startLive() { if (!this.liveTimer) { this.refreshLive(); this.liveTimer = setInterval(() => this.refreshLive(), 2000); } },
+  stopLive() { clearInterval(this.liveTimer); this.liveTimer = null; },
   async refresh() {
     try { this.render(await api('/api/agent-usage')); }
     catch { this.render(null); }
@@ -4705,7 +4763,8 @@ const usagePanel = {
     $('#usage-body').classList.toggle('hidden', !on);
     $('#usage-arrow').textContent = on ? '▾' : '▸';
     clearInterval(this.timer); this.timer = null;
-    if (on) { this.refresh(); this.timer = setInterval(() => this.refresh(), 60000); }
+    this.stopLive();
+    if (on) { this.refresh(); this.timer = setInterval(() => this.refresh(), 60000); this.startLive(); }
   },
   bind() {
     $('#usage-toggle').onclick = () => {
@@ -6071,6 +6130,7 @@ const cronPanel = {
 async function init() {
   // 桌面 app：标记 body，给顶部交通灯留位、顶部可拖拽
   if (window.fanboxEnv && window.fanboxEnv.isDesktopApp) document.documentElement.classList.add('desktop');
+  if (window.fanboxEnv && window.fanboxEnv.platform === 'win32') document.documentElement.classList.add('platform-win');
   try { window.fanboxWin?.trafficLights(true); } catch { /* 重载后兜底恢复系统按钮，防上次全屏藏了没显回来 */ }
   applyTheme(state.theme, false);
   if (state.sidebarCollapsed) { $('#app').classList.add('sidebar-collapsed'); $('#btn-sidebar')?.classList.add('on'); }
