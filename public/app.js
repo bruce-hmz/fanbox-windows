@@ -3831,7 +3831,12 @@ const term = {
     }
     const r = await bridge().catch(() => null);
     if (!r) return;
-    if (r.kind === 'text') { xterm.paste(r.text); return; }
+    if (r.kind === 'text') {
+      // Windows 上 Ctrl+V 会走两条路（keydown 自定义粘贴 + 菜单加速键的 paste 事件），内容级去重防双粘
+      if (r.text && r.text === this._lastPasteText && Date.now() - (this._lastPasteAt || 0) < 800) return;
+      if (r.text) { this._lastPasteText = r.text; this._lastPasteAt = Date.now(); }
+      xterm.paste(r.text); return;
+    }
     if (r.kind === 'image' || r.kind === 'file') {
       this.insertPath(r.path);
       if (r.kind === 'image') toast('剪贴板图片已存成文件，路径已插入终端');
@@ -4117,7 +4122,13 @@ const term = {
     host.addEventListener('paste', (ev) => {
       const files = ev.clipboardData ? [...(ev.clipboardData.files || [])] : [];
       const img = files.find((f) => f.type.startsWith('image/'));
-      if (!img || !window.fanboxDrop) return; // 纯文字粘贴交给 xterm 自己处理
+      if (!img || !window.fanboxDrop) {
+        // 纯文字粘贴交给 xterm 自己处理，但要防 Ctrl+V 双路径的第二遍
+        const text = ev.clipboardData ? ev.clipboardData.getData('text/plain') : '';
+        if (text && text === term._lastPasteText && Date.now() - (term._lastPasteAt || 0) < 800) { ev.preventDefault(); ev.stopPropagation(); return; }
+        if (text) { term._lastPasteText = text; term._lastPasteAt = Date.now(); }
+        return;
+      }
       ev.preventDefault();
       ev.stopPropagation(); // 别让 xterm 拿这个事件去粘一段空文本
       if (Date.now() - (term.pastedAt || 0) < 800) return; // ⌘V 那条路已经插过了，别插第二遍
