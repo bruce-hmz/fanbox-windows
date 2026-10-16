@@ -3093,6 +3093,7 @@ function bindEvents() {
   shotTray.init();
   $('#skills-entry').onclick = () => skillsView.show();
   $('#cron-entry').onclick = () => cronPanel.show();
+  $('#btn-term-tiles').onclick = () => term.setTileMode(term.tile.mode === 4 ? 1 : (term.tile.mode === 2 ? 4 : 2));
   $('#term-newtab').onclick = () => { wechatView.close(); term.newTab(); };
   // 双击终端顶栏空白处（避开标签/按钮/输入框）= 铺满终端：agent 交互窗口最重要，给它一键放到最大
   $('.term-head').addEventListener('dblclick', (ev) => {
@@ -3120,7 +3121,18 @@ function bindEvents() {
   // 定位文件按钮已撤（双击终端 tab 即可定位，见 term.locateCwd / renderTabs 的 ondblclick）
   // 终端随窗口尺寸变化重排，避免 TUI 错位
   window.addEventListener('resize', () => term.fitActive());
-  if (window.ResizeObserver) new ResizeObserver(() => term.fitActive()).observe($('#xterm-host'));
+  if (window.ResizeObserver) new ResizeObserver(() => term.applyTiles(true)).observe($('#xterm-host')); // host 尺寸变 → 重算各格矩形并逐格 fit
+  $('#xterm-host').addEventListener('mousedown', (e) => {
+    const head = e.target.closest('.tile-head');
+    if (head) {
+      const sid = head.dataset.id;
+      if (e.target.classList.contains('tile-x')) { term.closeTab(sid); return; }
+      if (sid && sid !== term.active) term.activate(sid);
+      return;
+    }
+    const inst = e.target.closest('.xterm-instance');
+    if (inst && inst.dataset.id && inst.dataset.id !== term.active) term.activate(inst.dataset.id);
+  });
   bindTerminalResizer();
   // 拖拽文件/文件夹到终端 → 插入路径
   const tp = $('#terminal-panel');
@@ -3696,6 +3708,7 @@ const TERM_ASK_RE = /(Do you want to (proceed|continue|make this edit|allow|use 
 const term = {
   sessions: [], seq: 0, active: null, maximized: false,
   dock: localStorage.getItem('fb_term_dock') || 'right',
+  tile: { mode: [1, 2, 4].includes(Number(localStorage.getItem('fb_term_tiles'))) ? Number(localStorage.getItem('fb_term_tiles')) : 1, slots: [] }, // 平铺:mode 1=单窗 2=左右 4=四宫格,slots=各格会话 id
   available() { return !!(window.fanboxPty && window.Terminal && !window.__noXterm); },
   // 每套皮肤一整套手调 ANSI 主题——暗皮肤暗终端、亮皮肤亮终端，不再出现「暖纸里嵌黑块」
   themes: {
@@ -3725,6 +3738,7 @@ const term = {
     $('#terminal-panel').classList.remove('hidden');
     $('#terminal-resizer').classList.remove('hidden');
     this.applyDock();
+    if (this.tile.mode > 1) { const b = $('#btn-term-tiles'); if (b) b.classList.add('on'); this.normalizeSlots(); this.applyTiles(); }
     if (!this.sessions.length) this.newTab();
     else this.fitActive();
     $('#btn-terminal').classList.add('active');
@@ -3758,10 +3772,12 @@ const term = {
     $('#terminal-panel').classList.remove('hidden');
     $('#terminal-resizer').classList.remove('hidden');
     this.applyDock();
+    if (this.tile.mode > 1) { const b = $('#btn-term-tiles'); if (b) b.classList.add('on'); this.normalizeSlots(); this.applyTiles(); }
     $('#btn-terminal').classList.add('active');
     // 并行 spawn：newTab 在第一个 await 前就把 session 压进数组，按调用顺序排——标签顺序不变，
     // 而 8 个 pty 的启动从串行 8 次往返变成一轮
     await Promise.all((saved.tabs || []).slice(0, 8).map((t) => this.newTab(t.cwd || undefined)));
+    this.normalizeSlots(); // 按快照顺序填窗格
     const want = this.sessions[saved.active];
     if (want) this.activate(want.id);
     if (!this.sessions.length) this.newTab(); // 快照坏了也保证有一个标签
@@ -4015,6 +4031,7 @@ const term = {
     const host = document.createElement('div');
     host.className = 'xterm-instance';
     $('#xterm-host').appendChild(host);
+    host.dataset.id = id;
     host.classList.add('show'); // 先可见再 open/fit：display:none 下 fit 量不出尺寸，PTY 会以 80 列出生
     const FitCtor = window.FitAddon ? (window.FitAddon.FitAddon || window.FitAddon) : null;
     const xterm = new window.Terminal({
@@ -4277,8 +4294,15 @@ const term = {
     else sess.cwd = r.cwd || sess.startDir;
   },
   activate(id) {
+    if (this.tile.mode > 1 && !this.tile.slots.includes(id)) {
+      // 「点标签进当前格」:进原活动会话所在的格;有空格先填空格
+      let target = this.tile.slots.findIndex((x) => !x || !this.sessions.some((s) => s.id === x));
+      if (target < 0) target = this.tile.slots.indexOf(this.active);
+      if (target < 0) target = this.tile.slots.length < this.tile.mode ? this.tile.slots.length : 0;
+      this.tile.slots[target] = id;
+    }
     this.active = id;
-    this.sessions.forEach((s) => s.host.classList.toggle('show', s.id === id));
+    this.applyTiles();
     const cur = this.sessions.find((x) => x.id === id);
     if (cur) cur.unread = false; // 切到该标签即清未读
     this.renderTabs();
@@ -4298,12 +4322,86 @@ const term = {
     try { s.xterm.dispose(); } catch { /* */ }
     s.host.remove();
     this.sessions.splice(i, 1);
+    this.normalizeSlots(); // 窗格移除该会话,空格拉入下一个不可见会话补位
     updateWatches(); // 该终端的项目目录不再需要监听
     if (!this.sessions.length) { this.close(); roster.render(); return; } // 不经 renderTabs，角标得在这清零
     if (this.active === id) this.activate(this.sessions[Math.max(0, i - 1)].id);
-    else this.renderTabs();
+    else { this.renderTabs(); this.applyTiles(); }
+  },
+  visibleSessions() {
+    return this.tile.slots.map((id) => this.sessions.find((s) => s.id === id)).filter(Boolean);
+  },
+  normalizeSlots() {
+    const valid = this.tile.slots.filter((x) => x && this.sessions.some((s) => s.id === x)).slice(0, this.tile.mode);
+    const rest = this.sessions.filter((s) => !valid.includes(s.id)).map((s) => s.id);
+    while (valid.length < Math.min(this.tile.mode, this.sessions.length) && rest.length) valid.push(rest.shift());
+    this.tile.slots = valid;
+  },
+  tileRects(n) {
+    const host = $('#xterm-host');
+    const W = host.clientWidth, H = host.clientHeight, g = 6;
+    if (n <= 1 || this.tile.mode === 1) return [{ x: 0, y: 0, w: W, h: H }];
+    if (this.tile.mode === 2) {
+      const w = (W - g) / 2;
+      return [{ x: 0, y: 0, w, h: H }, { x: w + g, y: 0, w: W - w - g, h: H }];
+    }
+    const w = (W - g) / 2, h = (H - g) / 2;
+    return [
+      { x: 0, y: 0, w, h },
+      { x: w + g, y: 0, w: W - w - g, h },
+      { x: 0, y: h + g, w, h: H - h - g },
+      { x: w + g, y: h + g, w: W - w - g, h: H - h - g },
+    ].slice(0, n);
+  },
+  // 平铺布局:实例内联定位 + 窄标题条 + 逐格 fit。mode 1 时完全回到单窗现状。onlyLayout=true 时不重建标题文字之外的东西
+  applyTiles(onlySize) {
+    const host = $('#xterm-host');
+    if (this.tile.mode === 1 || this.sessions.length <= 1) {
+      host.querySelectorAll('.tile-head').forEach((el) => el.remove());
+      this.sessions.forEach((s) => { s.host.classList.toggle('show', s.id === this.active); s.host.style.cssText = ''; });
+      return;
+    }
+    this.normalizeSlots();
+    const vis = this.visibleSessions();
+    const rects = this.tileRects(vis.length);
+    const HEAD = 20;
+    const shown = new Set();
+    vis.forEach((s, i) => {
+      const rc = rects[i];
+      shown.add(s.id);
+      s.host.classList.add('show');
+      s.host.style.cssText = 'left:' + rc.x + 'px;top:' + (rc.y + HEAD) + 'px;width:' + rc.w + 'px;height:' + Math.max(60, rc.h - HEAD) + 'px;';
+    });
+    this.sessions.forEach((s) => { if (!shown.has(s.id)) { s.host.classList.remove('show'); s.host.style.cssText = ''; } });
+    let heads = host.querySelector('.tile-heads');
+    if (!heads) { heads = document.createElement('div'); heads.className = 'tile-heads'; host.appendChild(heads); }
+    if (!onlySize) {
+      heads.innerHTML = vis.map((s, i) => {
+        const dot = s.dead ? 'dead' : (s.status === 'busy' ? 'busy' : 'idle');
+        return '<div class="tile-head' + (s.id === this.active ? ' active' : '') + '" data-id="' + s.id + '" style="left:' + rects[i].x + 'px;top:' + rects[i].y + 'px;width:' + rects[i].w + 'px">' +
+          '<span class="tab-dot ' + dot + '"></span><span class="tile-title">' + escapeHtml(s.title || 'shell') + '</span>' +
+          '<span class="tile-x" title="关闭">✕</span></div>';
+      }).join('');
+    }
+    requestAnimationFrame(() => vis.forEach((s) => { try { s.fit && s.fit.fit(); } catch { /* */ } }));
+  },
+  setTileMode(mode) {
+    this.tile.mode = mode;
+    localStorage.setItem('fb_term_tiles', String(mode));
+    if (mode > 1) {
+      const btn = $('#btn-term-tiles'); if (btn) btn.classList.add('on');
+      this.normalizeSlots();
+      this.applyTiles();
+      toast(mode === 2 ? '终端:左右双窗 · 点标签换入当前格' : '终端:四宫格 · 点标签换入当前格');
+    } else {
+      const btn = $('#btn-term-tiles'); if (btn) btn.classList.remove('on');
+      this.applyTiles();
+      this.fitActive();
+      toast('终端:单窗');
+    }
   },
   fitActive() {
+    if (this.tile.mode > 1) { const vis = this.visibleSessions(); requestAnimationFrame(() => vis.forEach((s) => { try { s.fit && s.fit.fit(); } catch { /* */ } })); return; }
     const s = this.sessions.find((x) => x.id === this.active);
     if (!s || !s.fit) return;
     requestAnimationFrame(() => { try { s.fit.fit(); } catch { /* */ } });
@@ -4571,6 +4669,7 @@ const term = {
       };
       bar.appendChild(t);
     });
+    if (this.tile.mode > 1) this.applyTiles(); // 标题条的状态点/标题跟标签状态走
     roster.render(); // 标签的每次变化指挥台都跟着重画（状态/标题/增删）
   },
   // 换主题后 WebGL 图集里缓存的还是旧配色字形，且 CJK 宽字符偶发图集损坏（#37/#45）：清一次图集强制重栅格化。

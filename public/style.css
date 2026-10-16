@@ -1516,3 +1516,12 @@ body { transition: background-color 0.28s ease, color 0.28s ease; }
    品牌行本身是拖拽区,上移后「名称及其上方」整块都能拖窗 */
 .platform-win #sidebar { padding-top: 0; }
 .platform-win .brand { padding: 16px 8px 16px; }
+/* ---------- 终端分屏:窗格标题条 ---------- */
+.tile-heads { position: absolute; inset: 0; pointer-events: none; z-index: 3; }
+.tile-head { position: absolute; height: 20px; display: flex; align-items: center; gap: 6px; padding: 0 6px; background: var(--bg-2); border-bottom: 1px solid var(--border); font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); cursor: pointer; pointer-events: auto; user-select: none; box-sizing: border-box; }
+.tile-head.active { color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
+.tile-head .tile-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.tile-head .tile-x { flex: none; opacity: .45; padding: 1px 4px; border-radius: 3px; }
+.tile-head .tile-x:hover { opacity: 1; color: var(--accent); }
+.tile-head .tab-dot { flex: none; }
+#btn-term-tiles.on { color: var(--accent); border-color: var(--accent); }
