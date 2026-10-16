@@ -1525,3 +1525,5 @@ body { transition: background-color 0.28s ease, color 0.28s ease; }
 .tile-head .tile-x:hover { opacity: 1; color: var(--accent); }
 .tile-head .tab-dot { flex: none; }
 #btn-term-tiles.on { color: var(--accent); border-color: var(--accent); }
+/* 会话面板:续上/接力按钮组 */
+.mem-acts { display: inline-flex; gap: 5px; flex: none; }

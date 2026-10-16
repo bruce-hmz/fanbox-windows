@@ -920,6 +920,150 @@ async function projectMemory(p) {
   return { ok: true, cwd, sessions: sessions.filter((s) => s.title || s.files.length).slice(0, 40) };
 }
 
+// ---------- 跨 agent 会话接力：从源会话日志提取「交接纪要」落盘，目标 agent 读纪要继续任务 ----------
+// 会话上下文锁在各家私有存储里（claude --resume 只认 claude），跨家续接的唯一正道是把任务状态
+// 搬运出来：用户最近的原话 + 助手最后进展 + 改过的文件。claude/codex 有本地日志走富提取，
+// 其余 agent 只有面板元数据，纪要里给标题+文件清单+指示其自行勘察现场。
+const HANDOFF_DIR = path.join(CONFIG_DIR, 'handoffs');
+async function handoffCreate(p, agent, id) {
+  const cwd = resolvePath(p);
+  if (!id) return { ok: false, error: '缺少会话 id' };
+  // 会话元数据统一从项目记忆的适配器拿（title/files/skills 四家都齐）
+  const mem = await projectMemory(p);
+  const meta = (mem.sessions || []).find((s) => s.agent === agent && s.id === id);
+  if (!meta) return { ok: false, error: '该项目下没找到这个会话' };
+  const brief = { lastUser: [], lastA: '', n: 0 };
+  try {
+    if (agent === 'claude') {
+      const fp = path.join(CLAUDE_PROJ, mungeClaudeDir(cwd), id + '.jsonl');
+      await extractClaudeTranscript(fp, brief);
+    } else if (agent === 'codex') {
+      const fp = await findCodexRollout(id);
+      if (fp) await extractCodexTranscript(fp, brief);
+    }
+  } catch { /* 提取失败退元数据纪要，不挡接力 */ }
+  const fmtT = (t) => t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : '';
+  const lines = [];
+  lines.push('# 任务交接纪要');
+  lines.push('');
+  lines.push(`- 源会话：${agent}「${(meta.title || '无标题会话').slice(0, 120)}」`);
+  lines.push(`- 项目目录：${cwd}`);
+  lines.push(`- 最后活动：${fmtT(meta.lastT)} · 用户消息 ${meta.userMsgs} 条 · 改动文件 ${meta.files.length} 个`);
+  lines.push('');
+  if (brief.lastUser.length) {
+    lines.push('## 用户最近的要求（原话，越靠下越新）');
+    lines.push('');
+    for (const u of brief.lastUser) { lines.push('> ' + u.replace(/\n/g, '\n> ')); lines.push(''); }
+  } else if (meta.title) {
+    lines.push('## 任务标题（用户首条要求）');
+    lines.push('');
+    lines.push('> ' + meta.title);
+    lines.push('');
+  }
+  if (brief.lastA) {
+    lines.push('## 助手最后的进展摘录');
+    lines.push('');
+    lines.push(brief.lastA);
+    lines.push('');
+  }
+  if (meta.files.length) {
+    lines.push('## 本会话改动过的文件');
+    lines.push('');
+    for (const f of meta.files.slice(0, 30)) lines.push('- ' + f);
+    lines.push('');
+  }
+  if (meta.skills && meta.skills.length) { lines.push(`- 用过的 skills：${meta.skills.join('、')}`); lines.push(''); }
+  lines.push('## 给接手 agent 的指示');
+  lines.push('');
+  lines.push('以上是此前另一个 agent 会话的交接纪要。请先读取上面列出的关键文件、结合项目现状核对进度，然后继续完成用户最近提出的要求；拿不准的地方先向用户确认，不要凭空重做已完成的部分。');
+  await fsp.mkdir(HANDOFF_DIR, { recursive: true });
+  const safe = (cwd.split(/[\\/]/).filter(Boolean).pop() || 'project').replace(/[^\w.-]+/g, '_').slice(0, 40);
+  const file = path.join(HANDOFF_DIR, `${safe}-${agent}-${Date.now()}.md`);
+  await fsp.writeFile(file, lines.join('\n'));
+  pruneHandoffs();
+  return { ok: true, file, title: meta.title || '', extracted: brief.lastUser.length > 0 };
+}
+
+async function extractClaudeTranscript(fp, brief) {
+  const st = await fsp.stat(fp).catch(() => null);
+  if (!st) return;
+  // 只读尾部 256KB：交接只关心最近对话，整读大会话纯浪费
+  const fh = await fsp.open(fp, 'r');
+  let txt;
+  try {
+    const len = Math.min(st.size, 262144);
+    const buf = Buffer.alloc(len);
+    await fh.read(buf, 0, len, st.size - len);
+    txt = buf.toString('utf8');
+  } finally { await fh.close(); }
+  for (const line of txt.split('\n')) {
+    if (!line.includes('"type":"') && !line.includes('"content"')) continue;
+    let d; try { d = JSON.parse(line); } catch { continue; }
+    const m = d && d.message;
+    if (!m || !Array.isArray(m.content) && typeof m.content !== 'string') continue;
+    const text = typeof m.content === 'string' ? m.content : m.content.filter((x) => x.type === 'text').map((x) => x.text).join('\n');
+    if (!text || text.startsWith('<') || text.startsWith('Caveat:')) continue;
+    if (d.type === 'user' && !d.isMeta) {
+      brief.lastUser.push(text.trim().slice(0, 600));
+      if (brief.lastUser.length > 6) brief.lastUser.shift();
+    } else if (d.type === 'assistant' && text.trim()) {
+      brief.lastA = text.trim().slice(0, 1000);
+    }
+  }
+}
+
+async function extractCodexTranscript(fp, brief) {
+  const st = await fsp.stat(fp).catch(() => null);
+  if (!st) return;
+  const fh = await fsp.open(fp, 'r');
+  let txt;
+  try {
+    const len = Math.min(st.size, 262144);
+    const buf = Buffer.alloc(len);
+    await fh.read(buf, 0, len, st.size - len);
+    txt = buf.toString('utf8');
+  } finally { await fh.close(); }
+  for (const line of txt.split('\n')) {
+    if (!line.includes('"role":"user"') && !line.includes('"role":"assistant"')) continue;
+    let d; try { d = JSON.parse(line); } catch { continue; }
+    const pl = d && d.payload;
+    if (!pl || !pl.role) continue;
+    const parts = Array.isArray(pl.content) ? pl.content : [];
+    const text = parts.map((x) => x.text || x.input_text || x.output_text || '').filter((t) => t && !t.startsWith('<')).join('\n');
+    if (!text) continue;
+    if (pl.role === 'user') {
+      brief.lastUser.push(text.trim().slice(0, 600));
+      if (brief.lastUser.length > 6) brief.lastUser.shift();
+    } else {
+      brief.lastA = text.trim().slice(0, 1000);
+    }
+  }
+}
+
+async function findCodexRollout(id) {
+  let found = null;
+  const walk = async (dir, depth) => {
+    if (found || depth > 3) return;
+    let names;
+    try { names = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const n of names) {
+      const fp = path.join(dir, n.name);
+      if (n.isDirectory()) await walk(fp, depth + 1);
+      else if (n.isFile() && n.name.endsWith('.jsonl') && n.name.includes(id)) { found = fp; return; }
+    }
+  };
+  await walk(CODEX_SESS, 0);
+  return found;
+}
+
+// 纪要文件是小快照，但也会无限涨：只留最近 30 份
+function pruneHandoffs() {
+  fsp.readdir(HANDOFF_DIR).then(async (files) => {
+    const md = files.filter((f) => f.endsWith('.md')).sort();
+    for (const f of md.slice(0, Math.max(0, md.length - 30))) await fsp.unlink(path.join(HANDOFF_DIR, f)).catch(() => {});
+  }).catch(() => {});
+}
+
 // ---------- 磁盘占用透视：算清当前目录每个子项的真实占用 ----------
 // 文件直接 stat（快）；目录一次 du -sk 批量算。du 碰到无权限子目录会报错但仍输出能算的部分，所以忽略 err 只用 stdout
 async function diskUsage(p) {
@@ -3157,6 +3301,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/api/project-memory') {
       return sendJSON(res, 200, await projectMemory(url.searchParams.get('path')));
+    }
+    if (p === '/api/handoff' && req.method === 'POST') {
+      const b = await readBody(req);
+      return sendJSON(res, 200, await handoffCreate(String(b.path || ''), String(b.agent || ''), String(b.id || '')));
     }
     if (p === '/api/lang' && req.method === 'POST') {
       const b = await readBody(req);

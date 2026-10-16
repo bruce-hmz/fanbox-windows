@@ -2024,7 +2024,7 @@ async function memoryPanel(dirPath) {
       <div class="mem-head" data-i="${i}">
         <span class="mem-agent${s.agent === 'claude' ? '' : ' codex'}">${escapeHtml(sessCfg(s.agent).badge || (s.agent || '?')[0].toUpperCase())}</span>
         <span class="mem-title">${escapeHtml(s.title || '（无标题会话）')}</span>
-        <button class="ghost-btn mem-resume" data-i="${i}" title="在内嵌终端里接上这段会话的上下文继续">▶ 续上</button>
+        <span class="mem-acts"><button class="ghost-btn mem-resume" data-i="${i}" title="在内嵌终端里接上这段会话的上下文继续(原 agent 原会话)">▶ 续上</button><button class="ghost-btn mem-handoff" data-i="${i}" title="生成任务交接纪要,换其他 agent 继续这个任务">⚡ 接力</button></span>
       </div>
       <div class="mem-meta">${fmtTime(s.lastT)}${s.userMsgs != null ? ` · ${s.userMsgs} 条消息` : ''}${s.files.length ? ` · 改了 ${s.files.length} 个文件` : ''}${s.skills.length ? ' · ' + s.skills.map((k) => `<i class="mem-skill">${escapeHtml(k)}</i>`).join(' ') : ''}</div>
       ${s.files.length ? `<div class="mem-files hidden">${s.files.map((f) => `<div class="mem-file" data-p="${escapeHtml(f)}" title="${escapeHtml(f)}">${escapeHtml(f.startsWith(dirPath + '/') ? f.slice(dirPath.length + 1) : f.replace(state.home, '~'))}</div>`).join('')}</div>` : ''}
@@ -2043,6 +2043,25 @@ async function memoryPanel(dirPath) {
       const cmd = tpl.replace('{id}', s.id);
       close();
       term.runInDir(dirPath, cmd, '已在终端续上会话');
+    };
+  });
+  body.querySelectorAll('.mem-handoff').forEach((b) => {
+    b.onclick = (ev) => {
+      ev.stopPropagation(); // 打开菜单的这次 click 不能冒泡到 document 的全局关闭器(3231 行),否则菜单开了即关
+      ev.preventDefault();
+      const hs = d.sessions[Number(b.dataset.i)];
+      // 候选 = 注册表里能吃命令行初始输入的 agent(排除桌面应用型与源 agent 自己)
+      const cands = AGENT_REGISTRY.filter((a) => !a.app && a.id !== hs.agent);
+      popupMenu(ev, cands.map((a) => ({
+        label: '用 ' + a.label + ' 接力',
+        fn: async () => {
+          const r = await apiPost('/api/handoff', { path: dirPath, agent: hs.agent, id: hs.id }).catch(() => null);
+          if (!r || !r.ok) { toast('生成交接纪要失败' + (r && r.error ? '：' + r.error : ''), true); return; }
+          const prompt = '请先读取 ' + r.file + ' ,这是此前用 ' + hs.agent + ' 做的任务的交接纪要,按纪要继续完成任务';
+          close();
+          term.runInDir(dirPath, a.cmd + ' "' + prompt + '"', '交接纪要已生成,由 ' + a.label + ' 接力');
+        },
+      })));
     };
   });
   body.querySelectorAll('.mem-file').forEach((f) => {
